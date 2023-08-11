@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <torch/extension.h>
 #include <vector>
+#include "gptq_hemm.h"
 #define SHARE_MEM_SIZE (48 *  1024)
 inline __device__ float relu(const float x) { return x < 0 ? 0 : x; }
 inline __device__ float gelu(const float x)
@@ -336,7 +337,36 @@ at::Tensor gptq_act_linear_layer(at::Tensor& input,
                 }
                 else
                 {
-                    printf("cuda kernel not support batch * seq_len > 1\n");
+                    static size_t act_shmem_max_size = initMmaAsyncStage4();
+                    size_t M = input_dim1;
+                    size_t N = weight_dim0;
+                    size_t K = input_dim0;
+                    size_t qkv_n = qkv_fused? 3:1;
+
+                    dim3 block(THREADS_PER_BLOCK);
+                    // dim3 grid(BLOCK_STRIDE, div_ceil(M, BLOCK_ROWS), div_ceil(N, BLOCK_COLS * BLOCK_STRIDE));
+                    // dim3 grid(div_ceil(M, BLOCK_ROWS), div_ceil(N, BLOCK_COLS));
+                    // printf("x ,y %d %d\n",div_ceil(M, BLOCK_ROWS), div_ceil(N, BLOCK_COLS) );
+                    // printf("x ,y %d %d %d\n",M, N, K);
+
+                    dim3 grid(BLOCK_STRIDE, div_ceil(M, BLOCK_ROWS), qkv_n * div_ceil(N, BLOCK_COLS * BLOCK_STRIDE));
+
+                    gptq_bgemm_v3<<<grid, block, act_shmem_max_size>>>(input_ptr,
+                                        weight_ptr,
+                                        weight_scales_ptr,
+                                        weight_zeros_ptr,
+                                        bias_ptr,
+                                        residual_ptr,
+                                        output_ptr,
+                                        input_dim1, 
+                                        weight_dim0, 
+                                        input_dim0,
+                                        group_size,
+                                        act_type,
+                                        add_bias,
+                                        add_residual,
+                                        qkv_fused
+                                        );
                 }
 
 #ifdef BENCHMARK

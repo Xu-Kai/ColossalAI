@@ -48,7 +48,7 @@ class CaiGPTQLinearOp(BaseOp):
             add_residual = False
         x = input.view(-1, input.shape[-1])
 
-        if x.shape[0] > 1:
+        if x.shape[0] < 0:
             out = gptq_fused_linear_triton(x, weight, weight_scales, weight_zeros, bias, residual,
                         self.bits, self.maxq, self.group_size, qkv_fused, add_bias, add_residual, act_type=act_type)
             if qkv_fused:
@@ -56,35 +56,37 @@ class CaiGPTQLinearOp(BaseOp):
             else:
                 out = out.view(input.shape[0], input.shape[1], weight.shape[-1])
         else:
-            print("inut shape, ", input.shape)
-            config = {
-                "input_dim": input.shape[-1],
-                "input_len": input.shape[0] * input.shape[1] ,
-                "add_bias": add_bias,
-                "add_residual": add_residual,
-                "qkv_fused": qkv_fused,
-                "act_type": act_type,
-                "out_dim": weight.shape[-1],
-                "in_dim": input.shape[-1], 
-                "wdtype": weight.dtype
-            }
+            # print("inut shape, ", input.shape)
+            # config = {
+            #     "input_dim": input.shape[-1],
+            #     "input_len": input.shape[0] * input.shape[1] ,
+            #     "add_bias": add_bias,
+            #     "add_residual": add_residual,
+            #     "qkv_fused": qkv_fused,
+            #     "act_type": act_type,
+            #     "out_dim": weight.shape[-1],
+            #     "in_dim": input.shape[-1], 
+            #     "wdtype": weight.dtype
+            # }
 
-            best_config = CaiGPTQLinearOp.autotune.get_best_config(config,
-                                    input,
-                                    weight,
-                                    weight_scales,
-                                    weight_zeros,
-                                    bias,
-                                    residual,
-                                    self.group_size,
-                                    act_type,
-                                    add_bias,
-                                    add_residual,
-                                    qkv_fused,
-                                    128,
-                                    128)
-            block_size_x = best_config['linear_x']
-            block_size_y = best_config['linear_y']
+            # best_config = CaiGPTQLinearOp.autotune.get_best_config(config,
+            #                         input,
+            #                         weight,
+            #                         weight_scales,
+            #                         weight_zeros,
+            #                         bias,
+            #                         residual,
+            #                         self.group_size,
+            #                         act_type,
+            #                         add_bias,
+            #                         add_residual,
+            #                         qkv_fused,
+            #                         128,
+            #                         128)
+            # block_size_x = best_config['linear_x']
+            # block_size_y = best_config['linear_y']
+            block_size_x = 128
+            block_size_y = input.shape[-1]
             out = self.linear_func(input,
                                     weight,
                                     weight_scales,

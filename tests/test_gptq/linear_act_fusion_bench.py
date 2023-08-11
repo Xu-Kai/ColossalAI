@@ -228,8 +228,8 @@ if __name__ == "__main__":
         linear.linear.weight.data.copy_(weight)
         linear.linear.bias.data.copy_(bias)
     inps = torch.randn(1, 1, infeature).to(torch.float16).to(torch.cuda.current_device())
-    quantizers = model_quant(linear, inps, torch.cuda.current_device(), args)
-    qweight, qscales, qzeros = model_cai_pack(linear, quantizers, qweight, qscales, qzeros, args.wbits, args.groupsize)
+    # quantizers = model_quant(linear, inps, torch.cuda.current_device(), args)
+    # qweight, qscales, qzeros = model_cai_pack(linear, quantizers, qweight, qscales, qzeros, args.wbits, args.groupsize)
 
 
     batch_inps = torch.randn(1, 16384, infeature).to(torch.float16).to(torch.cuda.current_device())
@@ -272,12 +272,12 @@ if __name__ == "__main__":
     time_end = time.time()
     torch_batch_linear_time = time_end - time_start
 
-    linear.to("cpu")
+    # linear.to("cpu")
 
-    gptq_model = model_pack(linear, quantizers, args.wbits, args.groupsize)
-    gptq_model.to(torch.cuda.current_device())
+    # gptq_model = model_pack(linear, quantizers, args.wbits, args.groupsize)
+    # gptq_model.to(torch.cuda.current_device())
 
-    # gptq_model = linear
+    gptq_model = linear
 
     for i in range(0, warm_up_iter):
         with torch.no_grad():
