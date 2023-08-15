@@ -9,6 +9,8 @@
 #include <torch/extension.h>
 #include <vector>
 #include "gptq_hemm.h"
+// #include "gptq_hemm_v3.h"
+
 #define SHARE_MEM_SIZE (48 *  1024)
 inline __device__ float relu(const float x) { return x < 0 ? 0 : x; }
 inline __device__ float gelu(const float x)
@@ -229,11 +231,15 @@ __global__ void gptq_gemm(T* input,
 
 
 
+
+
+
 template <typename T, typename TW>
 at::Tensor gptq_act_linear_layer(at::Tensor& input,
                                  at::Tensor& weight,
                                  at::Tensor& weight_scales,
                                  at::Tensor& weight_zeros,
+                                 at::Tensor& g_idx,
                                  at::Tensor& bias,
                                  at::Tensor& residual,
                                  int64_t group_size,
@@ -273,6 +279,7 @@ at::Tensor gptq_act_linear_layer(at::Tensor& input,
     T* residual_ptr      = (T*)residual.data_ptr();
     // at::cuda::CUDAStream defaultStream = at::cuda::getDefaultCUDAStream();
     auto stream = at::cuda::getCurrentCUDAStream().stream();
+    int32_t* g_idx_ptr = (int32_t*)g_idx.data_ptr();
 // #define BENCHMARK
 #ifdef BENCHMARK
     uint32_t block_xs[] = {128, 256, 512};
@@ -349,18 +356,23 @@ at::Tensor gptq_act_linear_layer(at::Tensor& input,
                     // printf("x ,y %d %d\n",div_ceil(M, BLOCK_ROWS), div_ceil(N, BLOCK_COLS) );
                     // printf("x ,y %d %d %d\n",M, N, K);
 
-                    dim3 grid(BLOCK_STRIDE, div_ceil(M, BLOCK_ROWS), qkv_n * div_ceil(N, BLOCK_COLS * BLOCK_STRIDE));
+                    // dim3 grid(BLOCK_STRIDE, div_ceil(M, BLOCK_ROWS), qkv_n * div_ceil(N, BLOCK_COLS * BLOCK_STRIDE));
 
-                    gptq_bgemm_v3<<<grid, block, act_shmem_max_size>>>(input_ptr,
+
+                    dim3 grid(div_ceil(N, 128), div_ceil(M, 256));
+                    // dim3 grid(BLOCK_STRIDE, div_ceil(M, BLOCK_ROWS), qkv_n * div_ceil(N, BLOCK_COLS * BLOCK_STRIDE));
+
+                    gptq_bgemm_final<T, TW> <<<grid, block, act_shmem_max_size>>>(input_ptr,
                                         weight_ptr,
                                         weight_scales_ptr,
                                         weight_zeros_ptr,
+                                        g_idx_ptr,
                                         bias_ptr,
                                         residual_ptr,
                                         output_ptr,
-                                        input_dim1, 
-                                        weight_dim0, 
-                                        input_dim0,
+                                        M, 
+                                        N, 
+                                        K,
                                         group_size,
                                         act_type,
                                         add_bias,
@@ -399,6 +411,7 @@ at::Tensor gptq_act_linear_layer(at::Tensor& input,
         at::Tensor & weight,                                                   \
         at::Tensor & weight_scales,                                            \
         at::Tensor & weight_zeros,                                             \
+         at::Tensor& g_idx,                                                     \
         at::Tensor & bias,                                                     \
         at::Tensor & residual,                                                  \
         int64_t group_size,                                                    \

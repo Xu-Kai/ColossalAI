@@ -33,6 +33,7 @@ class CaiGPTQLinearOp(BaseOp):
                 weight: torch.Tensor,
                 weight_scales: torch.Tensor,
                 weight_zeros: torch.Tensor,
+                g_idx: torch.Tensor = None,
                 act_type = 0,
                 bias: torch.Tensor = None,
                 residual: torch.Tensor=None,
@@ -47,6 +48,13 @@ class CaiGPTQLinearOp(BaseOp):
             residual = self.empty_tensor
             add_residual = False
         x = input.view(-1, input.shape[-1])
+
+        assert x.is_cuda and x.is_contiguous(), "input should be on cuda and contiguous"
+        assert weight.is_cuda and weight.is_contiguous(), "weight should be on cuda and contiguous"
+        assert weight_scales.is_cuda and weight_scales.is_contiguous(), "weight_scales should be on cuda and contiguous"
+        assert weight_zeros.is_cuda and weight_zeros.is_contiguous(), "weight_zeros should be on cuda and contiguous"
+        assert g_idx.is_cuda and g_idx.is_contiguous(), "weight_zeros should be on cuda and contiguous"
+
 
         if x.shape[0] < 0:
             out = gptq_fused_linear_triton(x, weight, weight_scales, weight_zeros, bias, residual,
@@ -91,6 +99,7 @@ class CaiGPTQLinearOp(BaseOp):
                                     weight,
                                     weight_scales,
                                     weight_zeros,
+                                    g_idx,
                                     bias,
                                     residual,
                                     self.group_size,

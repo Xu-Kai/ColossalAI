@@ -180,7 +180,7 @@ def cai_linear_pack(linear, scales, zeros,
     qzeros = qzeros.to("cuda")
     out_qzeros.data.copy_(qzeros)
 
-    return out_qweight, out_qscales, out_qzeros
+    return out_qweight, out_qscales, out_qzeros, g_idx
 
 def model_cai_pack(model, quantizers, qweight, qscales, qzeros, wbits, groupsize):
     layers = find_layers(model)
@@ -188,12 +188,12 @@ def model_cai_pack(model, quantizers, qweight, qscales, qzeros, wbits, groupsize
     with torch.no_grad():
         for name in layers:
             _, scale, zero, g_idx = quantizers[name]
-            qweight, qscales, qzeros = cai_linear_pack(layers[name], scale, zero, 
+            qweight, qscales, qzeros, g_idx = cai_linear_pack(layers[name], scale, zero, 
                         qweight, qscales, qzeros, g_idx, 
                         layers[name].weight.shape[-1], groupsize, wbits)
 
     # print("cai pack", layers)
-    return qweight, qscales, qzeros 
+    return qweight, qscales, qzeros, g_idx
 if __name__ == "__main__":
 
 
@@ -206,8 +206,8 @@ if __name__ == "__main__":
     parser.add_argument('--groupsize', type=int, default=128, help='Groupsize to use for quantization; default uses full row.')
     parser.add_argument('--act-order', action='store_true', help='Whether to apply the activation order GPTQ heuristic')
     args = parser.parse_args()
-    infeature = 5120
-    outfeature = 5120
+    infeature = 4096
+    outfeature = 4096
 
     weight = torch.randn(outfeature, infeature).to(torch.float16).to(torch.cuda.current_device())
     bias = torch.zeros(outfeature).to(torch.float16).to(torch.cuda.current_device())
@@ -220,12 +220,24 @@ if __name__ == "__main__":
     qweight = torch.zeros(infeature//wn, outfeature, dtype=ptype, device=torch.cuda.current_device()).contiguous()
     qscales = torch.zeros(infeature//args.groupsize, outfeature, dtype=torch.float16, device=torch.cuda.current_device()).contiguous()
     qzeros = torch.zeros(infeature//args.groupsize, outfeature//wn, dtype=ptype, device=torch.cuda.current_device()).contiguous()
+    g_idx = torch.tensor([i // args.groupsize for i in range(infeature)], dtype=torch.int32, device=torch.cuda.current_device()).contiguous()
 
     # print(linear.linear.weight)
     act_func = nn.SiLU()
 
     inps = torch.ones(1, 1, infeature).to(torch.float16).to(torch.cuda.current_device())
-    batch_inps = torch.randn(1, 4096, infeature).to(torch.float16).to(torch.cuda.current_device())
+    batch_inps = torch.zeros(1, 1024, infeature).to(torch.float16).to(torch.cuda.current_device())
+    one_inps = torch.ones(1024).to(torch.float16).to(torch.cuda.current_device())
+    batch_inps = batch_inps.transpose(1, 2)
+
+    batch_inps[:, :1024, :] = one_inps
+    # batch_inps[0][0][1] = 2.0
+    # batch_inps[0][0][2] = 3.0
+    # batch_inps[0][0][3] = 4.0
+    # batch_inps[0][0][4] = 5.0
+    # batch_inps[0][0][5] = 6.0
+
+    batch_inps = batch_inps.transpose(1, 2).contiguous()
 
     linear = MLinear(infeature, outfeature)
     linear.to(torch.cuda.current_device())
@@ -236,13 +248,13 @@ if __name__ == "__main__":
     with torch.no_grad():
         torch_out = linear(inps)
         batch_torch_out = linear(batch_inps)
-        torch_out = act_func(torch_out)
-        batch_torch_out = act_func(batch_torch_out)
+        # torch_out = act_func(torch_out)
+        # batch_torch_out = act_func(batch_torch_out)
     print("batch_torch out ", batch_torch_out)
 
     linear.to("cpu")
     quantizers = model_quant(linear, inps, torch.cuda.current_device(), args)
-    qweight, qscales, qzeros = model_cai_pack(linear, quantizers, qweight, qscales, qzeros, args.wbits, args.groupsize)
+    qweight, qscales, qzeros, g_idx = model_cai_pack(linear, quantizers, qweight, qscales, qzeros, args.wbits, args.groupsize)
     gptq_model = model_pack(linear, quantizers, args.wbits, args.groupsize)
     gptq_model.to(torch.cuda.current_device())
     # gptq_model = linear
@@ -251,13 +263,22 @@ if __name__ == "__main__":
     cai_linear = CaiGPTQLinearOp(cai_inf_config)
 
 
+    # qg = {'qweight': qweight, 'qscales': qscales, 'qzeros':qzeros, "g_idx":g_idx}
+    # torch.save(qg, "debug")
+
+    # qg = torch.load("debug")
+    # qweight = qg["qweight"].to("cuda")
+    # qscales = qg["qscales"].to("cuda")
+    # qzeros = qg["qzeros"].to("cuda")
+    # g_idx = qg["g_idx"].to("cuda")
     # qweight = torch.cat((qweight, qweight, qweight), dim=0).contiguous()
     # qscales = torch.cat((qscales, qscales, qscales), dim=0).contiguous()
     # qzeros = torch.cat((qzeros, qzeros, qzeros), dim=0).contiguous()
     # bias = torch.cat((bias, bias, bias), dim=0).contiguous()
     qkv_fused=False
     # inps[:, :, 256:] = 0
-
+    print(f"weight device {qweight.device} {qscales.device} {qzeros.device} {g_idx.device}")
+    g_idx = g_idx.to("cuda")
     with torch.no_grad():
         gptq_out = gptq_model(inps)
         batch_gptq_out = gptq_model(batch_inps)
@@ -265,6 +286,7 @@ if __name__ == "__main__":
                             qweight,
                             qscales,
                             qzeros,
+                            g_idx=g_idx,
                             bias = bias, 
                             act_type = 3,
                             qkv_fused=qkv_fused)
@@ -274,25 +296,34 @@ if __name__ == "__main__":
                             qweight,
                             qscales,
                             qzeros,
+                            g_idx=g_idx,
                             bias=bias,
                             act_type = 3,
                             qkv_fused=qkv_fused)
         torch.cuda.synchronize()
-        batch_gptq_out = act_func(batch_gptq_out)
-        gptq_out = act_func(gptq_out)
+        # batch_gptq_out = act_func(batch_gptq_out)
+        # gptq_out = act_func(gptq_out)
 
+    # print("we: ", qweight, qscales, qzeros, g_idx)
 
     # cai_out = cai_out[1]
     # batch_cai_out = batch_cai_out[1]
     a = torch.sum(qscales, 0)
-    print("qscales ", a)
-    print("orch out ", torch_out)
-    print("gptq out ", gptq_out)
-    print("cai out ", cai_out)
+    # print("qscales ", a)
+    # print("batch inps ", batch_inps[:, :, 32:33])
 
-    print("batch_torch out ", batch_torch_out)
-    print("batch_gptq out ", batch_gptq_out)
-    print("batch_cai out ", batch_cai_out)
+    # print("orch out ", torch_out)
+    # print("gptq out ", gptq_out)
+    # print("cai out ", cai_out)
+
+    # print("batch_torch out ", batch_torch_out[0,256,:])
+    # print("batch_gptq out ", batch_gptq_out[0,256,:])
+    # print("batch_cai out ", batch_cai_out[0,256,:])
+
+    # print("batch_torch out ", batch_torch_out)
+    # print("batch_gptq out ", batch_gptq_out)
+    # print("batch_cai out ", batch_cai_out)
+
 
     mean_diff = torch.mean(torch.abs(cai_out - gptq_out))
     max_diff = torch.max(torch.abs(cai_out - gptq_out))
@@ -303,8 +334,36 @@ if __name__ == "__main__":
     mean_diff = torch.mean(torch.abs(torch_out - cai_out))
     max_diff = torch.max(torch.abs(torch_out - cai_out))
     print("torch vs cai: mean_diff=%.8f, max_diff=%.8f" % (mean_diff, max_diff))
+    col_n = 8
+    row_n = 4
+    for i in range(256*row_n):
+        mean_diff = torch.mean(torch.abs(batch_cai_out[0, i, :128*col_n] - batch_gptq_out[0, i, :128*col_n]))
+        max_diff = torch.max(torch.abs(batch_cai_out[0, i, :128*col_n] - batch_gptq_out[0, i, :128*col_n]))
+        if mean_diff > 1e-3:
+            print("batch cai vs gptq: mean_diff=%.8f, max_diff=%.8f" % (mean_diff, max_diff))
+            print("row n ", i)
+            print("row n ", batch_cai_out[0, i, :128*col_n])
+            print("row n ", batch_gptq_out[0, i, :128*col_n])
+            break
 
-    mean_diff = torch.mean(torch.abs(batch_cai_out - batch_gptq_out))
+    for i in range(128*col_n):
+        mean_diff = torch.mean(torch.abs(batch_cai_out[0, :128*row_n, i] - batch_gptq_out[0, :128*row_n, i]))
+        max_diff = torch.max(torch.abs(batch_cai_out[0, :128*row_n, i] - batch_gptq_out[0, :128*row_n, i]))
+        if mean_diff > 1e-3:
+            print("batch cai vs gptq: mean_diff=%.8f, max_diff=%.8f" % (mean_diff, max_diff))
+            print("col n ", i)
+            print("col n ", batch_cai_out[0, :256*row_n, i])
+            print("col n ", batch_gptq_out[0, :256*row_n, i])
+            break
+
+    # print("diff  ", batch_gptq_out[0, 4, 0:32])
+    # print("diff  ", batch_cai_out[0, 4, 0:32])
+
+    mean_diff = torch.mean(torch.abs(batch_cai_out[0,:, 0] - batch_gptq_out[0,:, 0]))
+    max_diff = torch.max(torch.abs(batch_cai_out[0,:, 0] - batch_gptq_out[0,:, 0]))
+    print("batch cai vs gptq: mean_diff=%.8f, max_diff=%.8f" % (mean_diff, max_diff))
+
+    mean_diff = torch.mean(torch.abs(batch_cai_out[0,4,:128] - batch_gptq_out[0,4,:128]))
     max_diff = torch.max(torch.abs(batch_cai_out - batch_gptq_out))
     print("batch cai vs gptq: mean_diff=%.8f, max_diff=%.8f" % (mean_diff, max_diff))
     mean_diff = torch.mean(torch.abs(batch_torch_out - batch_gptq_out))

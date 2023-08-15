@@ -24,7 +24,7 @@ class CaiQuantLinear(nn.Module):
         self.register_buffer('qweight', torch.zeros((infeatures // 64 * self.bits, outfeatures), dtype=torch.int64))
         self.register_buffer('qzeros', torch.zeros((math.ceil(infeatures / self.groupsize), outfeatures // 64 * self.bits), dtype=torch.int64))
         self.register_buffer('scales', torch.zeros((math.ceil(infeatures / self.groupsize), outfeatures), dtype=torch.float16))
-        # self.register_buffer('g_idx', torch.tensor([i // self.groupsize for i in range(infeatures)], dtype=torch.int64))
+        self.register_buffer('g_idx', torch.tensor([i // self.groupsize for i in range(infeatures)], dtype=torch.int32))
         # self.order_qzeros = torch.zeros((math.ceil(infeatures / self.groupsize), outfeatures // 32 * self.bits), dtype=torch.int64)
         # self.register_buffer('input_idx', torch.zeros(infeatures], dtype=torch.int32))
 
@@ -109,7 +109,7 @@ class CaiQuantLinear(nn.Module):
         qzeros = torch.from_numpy(qzeros)
         qzeros = qzeros #.to(torch.cuda.current_device())
         self.qzeros.data.copy_(qzeros)
-
+        self.g_idx = g_idx
 
     def forward(self, x):
 
@@ -124,6 +124,7 @@ class CaiQuantLinear(nn.Module):
                             self.qweight,
                             self.scales,
                             self.qzeros,
+                            g_idx = self.g_idx,
                             bias = self.bias)
         print("shape is ", cai_out.shape)
         return cai_out

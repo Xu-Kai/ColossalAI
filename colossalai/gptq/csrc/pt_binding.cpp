@@ -12,12 +12,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "gptq linear kernel (CUDA)");
 
 
-    m.def("gptq_act_linear_fp16_w32",
-          &gptq_act_linear_layer<__half, uint32_t>,
-          "gptq linear kernel (CUDA)");
+//     m.def("gptq_act_linear_fp16_w32",
+//           &gptq_act_linear_layer<__half, uint32_t>,
+//           "gptq linear kernel (CUDA)");
 
-    m.def("gptq_act_linear_fp16_w8",
-          &gptq_act_linear_layer<__half, uint8_t>,
-          "gptq linear kernel (CUDA)");
+//     m.def("gptq_act_linear_fp16_w8",
+//           &gptq_act_linear_layer<__half, uint8_t>,
+//           "gptq linear kernel (CUDA)");
 
 }
