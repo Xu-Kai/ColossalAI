@@ -39,6 +39,7 @@ the computation block is [block_size_m, block_size_n] for one gpu thread block
 group_size: the group size for gptq quant
 add_bias: the linear has bias or not
 ***/
+
 template <typename T, typename TW>
 __global__ void gptq_gemm(T* input,
                                TW* weight,
@@ -100,6 +101,7 @@ __global__ void gptq_gemm(T* input,
 
     uint64_t current_group_size = group_size;
     uint64_t scale_dim1_ind     = block_m_start / group_size;
+
 
     for (uint64_t i = block_m_start; i < block_m_end; i += current_group_size)
     {

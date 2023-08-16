@@ -230,7 +230,7 @@ if __name__ == "__main__":
     one_inps = torch.ones(1024).to(torch.float16).to(torch.cuda.current_device())
     batch_inps = batch_inps.transpose(1, 2)
 
-    batch_inps[:, :1024, :] = one_inps
+    batch_inps[:, (infeature - 3072):infeature, :] = one_inps
     # batch_inps[0][0][1] = 2.0
     # batch_inps[0][0][2] = 3.0
     # batch_inps[0][0][3] = 4.0

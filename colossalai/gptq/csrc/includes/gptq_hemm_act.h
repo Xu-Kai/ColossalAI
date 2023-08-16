@@ -143,6 +143,9 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
     if (block_tile_i >= M_tiles || block_tile_j >= N_tiles) {
         return;
     }
+    // if (block_tile_j >= N_tiles) {
+    //     return;
+    // }
     const size_t n_weights_per_int = sizeof(TW) * 8 / W_BITS;
     const int32_t B_MASK = (1 << W_BITS) - 1;
 
@@ -169,35 +172,33 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
     size_t warp_zk_row_per_iter = WARP_SIZE / lanes_per_zk_row;
     size_t z_cols_per_lane = THREAD_COPY_BYTES / sizeof(TW);
     TW* zeros_ptr = weight_zeros + block_tile_j * MMA_N / n_weights_per_int;
-    // for(size_t i = 0; i < K / group_size; i += WARPS_PER_BLOCK)
-    // {
-    //     if( i * warp_zk_row_per_iter < K / group_size)
-    //     {
-    //         size_t Z_shmem_idx = i * warp_zk_row_per_iter + lane_id / lanes_per_zk_row;
-    //         int4* Z_lane_ptr = (int4*)(zeros_ptr 
-    //                         +  (i *warp_zk_row_per_iter + lane_id / lanes_per_zk_row) * ( N / n_weights_per_int) 
-    //                         +  lane_id % lanes_per_zk_row * z_cols_per_lane);
-    //         uint32_t Z_shmem_lane_addr = __cvta_generic_to_shared(&SHM_ZEROS(Z_shmem_idx,
-    //                                             lane_id % lanes_per_zk_row * z_cols_per_lane));
-    //         CP_ASYNC_CG(Z_shmem_lane_addr, Z_lane_ptr, THREAD_COPY_BYTES);
-    //     }  
-    // }
-    if(warp_id == 0)
+    for(size_t i = 0; i < K / group_size; i += WARPS_PER_BLOCK)
     {
-        for(size_t i = 0; i < K / group_size; i += 1)
+        if( i * warp_zk_row_per_iter < K / group_size)
         {
-
-            if(lane_id < BLOCK_COLS/n_weights_per_int)
-            {
-                SHM_ZEROS(i, lane_id) = zeros_ptr[i * N / n_weights_per_int + lane_id];
-            }
-        }
+            size_t Z_shmem_idx = i * warp_zk_row_per_iter + lane_id / lanes_per_zk_row;
+            int4* Z_lane_ptr = (int4*)(zeros_ptr 
+                            +  (i *warp_zk_row_per_iter + lane_id / lanes_per_zk_row) * ( N / n_weights_per_int) 
+                            +  lane_id % lanes_per_zk_row * z_cols_per_lane);
+            uint32_t Z_shmem_lane_addr = __cvta_generic_to_shared(&SHM_ZEROS(Z_shmem_idx,
+                                                lane_id % lanes_per_zk_row * z_cols_per_lane));
+            CP_ASYNC_CG(Z_shmem_lane_addr, Z_lane_ptr, THREAD_COPY_BYTES);
+        }  
     }
-
 
     CP_ASYNC_COMMIT_GROUP();
     CP_ASYNC_WAIT_GROUP(0);
     __syncthreads();
+
+    // if((block_tile_i + 1)* MMA_M > M)
+    // {
+    //     int *A_shmem = (int*)&shmem[0][0];
+    //     for(size_t  i = 0; i < BLOCK_COLS * BLOCK_ROWS / 2; i += threadIdx.x)
+    //     {
+    //         A_shmem[i + warp_id * WARP_SIZE + lane_id] = 0; 
+    //     }
+    // }
+
 
     const size_t shm_weight_off = 0;
     const size_t shm_scales_off = 0; 
@@ -221,25 +222,33 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
     const size_t s_cols_per_iter = WARP_SIZE / s_lanes_per_col * s_cols_per_lane;
     const size_t warps_load_s = BLOCK_COLS / s_cols_per_iter;
 
+    int32_t* idx_ptr = idx;
+
+
     const size_t W_shmem_stage_off = CHUNK_K * MMA_K / n_weights_per_int;
     // const size_t Z_shmem_stage_off = BLOCK_COLS / n_weights_per_int;
     const size_t Z_shmem_stage_off = 0;
     const size_t S_shmem_stage_off = (CHUNK_K * MMA_K + group_size - 1)/ group_size;
+    const size_t I_shmem_stage_off = 1;
 
     size_t W_shmem_store_off = 0;
     size_t S_shmem_store_off = 0;
+    size_t I_shmem_store_off = 0;
     size_t Z_shmem_store_off = 0;
 
     size_t W_shmem_load_off = 0;
     size_t S_shmem_load_off = 0;
+    size_t I_shmem_load_off = 0;
     size_t Z_shmem_load_off = 0;
 
     size_t W_shmem_idx = 0;
     size_t Z_shmem_idx = 0;
     size_t S_shmem_idx = 0;
+    size_t I_shmem_idx = 0;
 
     int2* W_lane_ptr = nullptr;
     int* S_lane_ptr = nullptr;
+    int* I_lane_ptr = nullptr;
 
 
 
@@ -280,20 +289,25 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
 
 #pragma unroll
     for (size_t i = 0; i < A_shmem_iters; ++i) {
-        uint32_t A_shmem_lane_addr = __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
-                                     ((lane_id % CHUNK_COPY_LINE_LANES +
-                                       (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
-                                      CHUNK_COPY_LINE_LANES) *
-                                         THREAD_COPY_BYTES;
+        if((uint64_t)A_lane_ptr < (uint64_t)&A[M*K-1])
+        {
+            uint32_t A_shmem_lane_addr = __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
+                                        ((lane_id % CHUNK_COPY_LINE_LANES +
+                                        (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
+                                        CHUNK_COPY_LINE_LANES) *
+                                            THREAD_COPY_BYTES;
 
-        CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
+            CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
 
-        A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
-        A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+            A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
+            A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+        }
     }
 
     W_shmem_store_off = 0;
     S_shmem_store_off = 0;
+    I_shmem_store_off = 0;
+    Z_shmem_store_off = 0;
 
     W_shmem_idx = shm_weight_off + W_shmem_store_off + lane_id % w_lanes_per_col;
     W_lane_ptr = (int2 *)(qweight_ptr + lane_id % w_lanes_per_col * N + warp_id * w_cols_per_warp + 
@@ -324,6 +338,17 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
         CP_ASYNC_CA(S_shmem_lane_addr, S_lane_ptr, THREAD_COPY_SCALE_BYTES);
     }
 
+
+    if(warp_id == warps_load_s)
+    {
+        I_shmem_idx = shm_idx_off + I_shmem_store_off;
+        I_lane_ptr = (int *)(idx_ptr + lane_id);
+        uint32_t I_shmem_lane_addr = __cvta_generic_to_shared(&SHM_IDX(I_shmem_idx,
+                 lane_id));
+        CP_ASYNC_CA(I_shmem_lane_addr, I_lane_ptr, 4);
+    }
+
+
     CP_ASYNC_COMMIT_GROUP();
 
 
@@ -336,20 +361,24 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
 
 #pragma unroll
     for (size_t i = 0; i < A_shmem_iters; ++i) {
-        uint32_t A_shmem_lane_addr = __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
-                                     ((lane_id % CHUNK_COPY_LINE_LANES +
-                                       (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
-                                      CHUNK_COPY_LINE_LANES) *
-                                         THREAD_COPY_BYTES;
+        if((uint64_t)A_lane_ptr < (uint64_t)&A[M*K-1])
+        {
+            uint32_t A_shmem_lane_addr = __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
+                                        ((lane_id % CHUNK_COPY_LINE_LANES +
+                                        (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
+                                        CHUNK_COPY_LINE_LANES) *
+                                            THREAD_COPY_BYTES;
 
-        CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
+            CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
 
-        A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
-        A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+            A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
+            A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+        }
     }
 
     W_shmem_store_off = shmem_store_idx * W_shmem_stage_off;
     S_shmem_store_off = shmem_store_idx * S_shmem_stage_off;
+    I_shmem_store_off = shmem_store_idx * I_shmem_stage_off;
     Z_shmem_store_off = shmem_store_idx * Z_shmem_stage_off;
 
     W_shmem_idx = shm_weight_off + W_shmem_store_off + lane_id % w_lanes_per_col;
@@ -382,7 +411,14 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
         CP_ASYNC_CA(S_shmem_lane_addr, S_lane_ptr, THREAD_COPY_SCALE_BYTES);
     }
 
-
+    if(warp_id == warps_load_s)
+    {
+        I_shmem_idx = shm_idx_off + I_shmem_store_off;
+        I_lane_ptr = (int *)(idx_ptr + lane_id + CHUNK_K*MMA_K);
+        uint32_t I_shmem_lane_addr = __cvta_generic_to_shared(&SHM_IDX(I_shmem_idx,
+                 lane_id));
+        CP_ASYNC_CA(I_shmem_lane_addr, I_lane_ptr, 4);
+    }
 
     CP_ASYNC_COMMIT_GROUP();
 
@@ -396,20 +432,24 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
 
 #pragma unroll
     for (size_t i = 0; i < A_shmem_iters; ++i) {
-        uint32_t A_shmem_lane_addr = __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
-                                     ((lane_id % CHUNK_COPY_LINE_LANES +
-                                       (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
-                                      CHUNK_COPY_LINE_LANES) *
-                                         THREAD_COPY_BYTES;
+        if((uint64_t)A_lane_ptr < (uint64_t)&A[M*K-1])
+        {
+            uint32_t A_shmem_lane_addr = __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
+                                        ((lane_id % CHUNK_COPY_LINE_LANES +
+                                        (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
+                                        CHUNK_COPY_LINE_LANES) *
+                                            THREAD_COPY_BYTES;
 
-        CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
+            CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
 
-        A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
-        A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+            A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
+            A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+        }
     }
 
     W_shmem_store_off = shmem_store_idx * W_shmem_stage_off;
     S_shmem_store_off = shmem_store_idx * S_shmem_stage_off;
+    I_shmem_store_off = shmem_store_idx * I_shmem_stage_off;
     Z_shmem_store_off = shmem_store_idx * Z_shmem_stage_off;
 
     W_shmem_idx = shm_weight_off + W_shmem_store_off + lane_id % w_lanes_per_col;
@@ -438,6 +478,15 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
                 warp_id * s_cols_per_iter)) + (lane_id / s_lanes_per_col) * THREAD_COPY_SCALE_BYTES;
 
         CP_ASYNC_CA(S_shmem_lane_addr, S_lane_ptr, THREAD_COPY_SCALE_BYTES);
+    }
+
+    if(warp_id == warps_load_s)
+    {
+        I_shmem_idx = shm_idx_off + I_shmem_store_off;
+        I_lane_ptr = (int *)(idx_ptr + 2 * CHUNK_K * MMA_K + lane_id);
+        uint32_t I_shmem_lane_addr = __cvta_generic_to_shared(&SHM_IDX(I_shmem_idx,
+                 lane_id));
+        CP_ASYNC_CA(I_shmem_lane_addr, I_lane_ptr, 4);
     }
 
     CP_ASYNC_COMMIT_GROUP();
@@ -473,8 +522,16 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
         float fs = __half2float(SHM_SCALES(0, W_shmem_idx));
         TW qw = SHM_WEIGHT(0,  W_shmem_idx);
 
+        int32_t z_id0 = SHM_IDX(0, lane_id%4 * 2);
+        int32_t z_id1 = SHM_IDX(0, lane_id%4 * 2 + 1);
+        int32_t z_id2 = SHM_IDX(0, 8 + lane_id%4 * 2);
+        int32_t z_id3 = SHM_IDX(0, 8 + lane_id%4 * 2 + 1);
 
-        TW qz0 = SHM_ZEROS(0,  (W_shmem_idx)/n_weights_per_int);
+
+        TW qz0 = SHM_ZEROS(z_id0,  (W_shmem_idx)/n_weights_per_int);
+        TW qz1 = SHM_ZEROS(z_id1,  (W_shmem_idx)/n_weights_per_int);
+        TW qz2 = SHM_ZEROS(z_id2,  (W_shmem_idx)/n_weights_per_int);
+        TW qz3 = SHM_ZEROS(z_id3,  (W_shmem_idx)/n_weights_per_int);
 
         half2 *RB_ptr = (half2*)&RB[reg_store_idx][j][0];
         int32_t w0 = (qw >> ((lane_id % 4)*4*2)) & B_MASK;
@@ -483,11 +540,13 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
         int32_t w3 = (qw >> (32 + (lane_id % 4)*4*2 + 4)) & B_MASK;
 
         int32_t z0 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
-
+        int32_t z1 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+        int32_t z2 = (qz1 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+        int32_t z3 = (qz1 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
         w0 = w0 - (z0 + 1);
-        w1 = w1 - (z0 + 1);
-        w2 = w2 - (z0 + 1);
-        w3 = w3 - (z0 + 1);
+        w1 = w1 - (z1 + 1);
+        w2 = w2 - (z2 + 1);
+        w3 = w3 - (z3 + 1);
         float2 fw0 = {float(w0) * fs, float(w1) * fs};
         float2 fw1 = {float(w2) * fs, float(w3) * fs};
         RB_ptr[0] = __float22half2_rn(fw0);
@@ -540,7 +599,15 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
 
             TW qw = SHM_WEIGHT(W_shmem_load_off + MMA_K / n_weights_per_int,  W_shmem_idx);
 
-            TW qz0 = SHM_ZEROS(Z_shmem_load_off + (tile_k - (K_STAGE -1)*CHUNK_K + 1) * MMA_K / group_size,  (W_shmem_idx)/n_weights_per_int);
+            int32_t z_id0 = SHM_IDX(I_shmem_load_off, MMA_K + (lane_id%4) * 2);
+            int32_t z_id1 = SHM_IDX(I_shmem_load_off, MMA_K + (lane_id%4) * 2 + 1);
+            int32_t z_id2 = SHM_IDX(I_shmem_load_off, MMA_K + 8 + (lane_id%4) * 2);
+            int32_t z_id3 = SHM_IDX(I_shmem_load_off, MMA_K + 8 + (lane_id%4) * 2 + 1);
+
+            TW qz0 = SHM_ZEROS(Z_shmem_load_off + z_id0,  (W_shmem_idx)/n_weights_per_int);
+            TW qz1 = SHM_ZEROS(Z_shmem_load_off + z_id1,  (W_shmem_idx)/n_weights_per_int);
+            TW qz2 = SHM_ZEROS(Z_shmem_load_off + z_id2,  (W_shmem_idx)/n_weights_per_int);
+            TW qz3 = SHM_ZEROS(Z_shmem_load_off + z_id3,  (W_shmem_idx)/n_weights_per_int);
 
             half2 *RB_ptr = (half2*)&RB[reg_store_idx][j][0];
             int32_t w0 = (qw >> ((lane_id % 4)*2 * 4)) & B_MASK;
@@ -549,12 +616,13 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
             int32_t w3 = (qw >> (32 + (lane_id % 4)*2*4 + 4)) & B_MASK;
 
             int32_t z0 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
-
-
+            int32_t z1 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+            int32_t z2 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+            int32_t z3 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
             w0 = w0 - (z0 + 1);
-            w1 = w1 - (z0 + 1);
-            w2 = w2 - (z0 + 1);
-            w3 = w3 - (z0 + 1);
+            w1 = w1 - (z1 + 1);
+            w2 = w2 - (z2 + 1);
+            w3 = w3 - (z3 + 1);
             float2 fw0 = {float(w0) * fs, float(w1) * fs};
             float2 fw1 = {float(w2) * fs, float(w3) * fs};
             RB_ptr[0] = __float22half2_rn(fw0);
@@ -589,21 +657,25 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
 
 #pragma unroll
         for (size_t i = 0; i < A_shmem_iters / CHUNK_K; ++i) {
-            uint32_t A_shmem_lane_addr =
-                __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
-                ((lane_id % CHUNK_COPY_LINE_LANES +
-                  (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
-                 CHUNK_COPY_LINE_LANES) *
-                    THREAD_COPY_BYTES;
+            if((uint64_t)A_lane_ptr < (uint64_t)&A[M*K-1])
+            {
+                uint32_t A_shmem_lane_addr =
+                    __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
+                    ((lane_id % CHUNK_COPY_LINE_LANES +
+                    (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
+                    CHUNK_COPY_LINE_LANES) *
+                        THREAD_COPY_BYTES;
 
-            CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
+                CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
 
-            A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
-            A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+                A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
+                A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+            }
         }
 
         W_shmem_store_off = shmem_store_idx * W_shmem_stage_off;
         S_shmem_store_off = shmem_store_idx * S_shmem_stage_off;
+        I_shmem_store_off = shmem_store_idx * I_shmem_stage_off;
         Z_shmem_store_off = shmem_store_idx * Z_shmem_stage_off;
 
 
@@ -636,20 +708,31 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
             CP_ASYNC_CA(S_shmem_lane_addr, S_lane_ptr, THREAD_COPY_SCALE_BYTES);
         }
 
+        if(warp_id == warps_load_s)
+        {
+            I_shmem_idx = shm_idx_off + I_shmem_store_off;
+            I_lane_ptr = (int *)(idx_ptr + tile_k * MMA_K + lane_id);
+            uint32_t I_shmem_lane_addr = __cvta_generic_to_shared(&SHM_IDX(I_shmem_idx,
+                    lane_id));
+            CP_ASYNC_CA(I_shmem_lane_addr, I_lane_ptr, 4);
+        }
 
 #pragma unroll
         for (size_t i = (CHUNK_K - 1) * A_shmem_iters / CHUNK_K; i < A_shmem_iters; ++i) {
-            uint32_t A_shmem_lane_addr =
-                __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
-                ((lane_id % CHUNK_COPY_LINE_LANES +
-                  (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
-                 CHUNK_COPY_LINE_LANES) *
-                    THREAD_COPY_BYTES;
+            if((uint64_t)A_lane_ptr < (uint64_t)&A[M*K-1])
+            {
+                uint32_t A_shmem_lane_addr =
+                    __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
+                    ((lane_id % CHUNK_COPY_LINE_LANES +
+                    (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
+                    CHUNK_COPY_LINE_LANES) *
+                        THREAD_COPY_BYTES;
 
-            CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
+                CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
 
-            A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
-            A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+                A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
+                A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+            }
         }
 
 
@@ -662,6 +745,7 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
         A_shmem_load_off = shmem_load_idx * A_shmem_stage_off;
         W_shmem_load_off = shmem_load_idx * W_shmem_stage_off;
         S_shmem_load_off = shmem_load_idx * S_shmem_stage_off;
+        I_shmem_load_off = shmem_load_idx * I_shmem_stage_off;
         Z_shmem_load_off = shmem_load_idx * Z_shmem_stage_off;
 
         reg_store_idx ^= 1;
@@ -687,7 +771,16 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
 
             float fs = __half2float(SHM_SCALES(S_shmem_load_off, W_shmem_idx));
             TW qw = SHM_WEIGHT(W_shmem_load_off,  W_shmem_idx);
-            TW qz0 = SHM_ZEROS(Z_shmem_load_off + (tile_k - (K_STAGE -1)*CHUNK_K + 2) * MMA_K / group_size,  (W_shmem_idx)/n_weights_per_int);
+
+            int32_t z_id0 = SHM_IDX(I_shmem_load_off, lane_id%4 * 2);
+            int32_t z_id1 = SHM_IDX(I_shmem_load_off, lane_id%4 * 2 + 1);
+            int32_t z_id2 = SHM_IDX(I_shmem_load_off, 8 + lane_id%4 * 2);
+            int32_t z_id3 = SHM_IDX(I_shmem_load_off, 8 + lane_id%4 * 2 + 1);
+
+            TW qz0 = SHM_ZEROS(Z_shmem_load_off + z_id0,  (W_shmem_idx)/n_weights_per_int);
+            TW qz1 = SHM_ZEROS(Z_shmem_load_off + z_id1,  (W_shmem_idx)/n_weights_per_int);
+            TW qz2 = SHM_ZEROS(Z_shmem_load_off + z_id2,  (W_shmem_idx)/n_weights_per_int);
+            TW qz3 = SHM_ZEROS(Z_shmem_load_off + z_id3,  (W_shmem_idx)/n_weights_per_int);
 
             half2 *RB_ptr = (half2*)&RB[reg_store_idx][j][0];
             int32_t w0 = (qw >> ((lane_id % 4)*4*2)) & B_MASK;
@@ -696,11 +789,13 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
             int32_t w3 = (qw >> (32 + (lane_id % 4)*4*2 + 4)) & B_MASK;
 
             int32_t z0 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
-
+            int32_t z1 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+            int32_t z2 = (qz1 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+            int32_t z3 = (qz1 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
             w0 = w0 - (z0 + 1);
-            w1 = w1 - (z0 + 1);
-            w2 = w2 - (z0 + 1);
-            w3 = w3 - (z0 + 1);
+            w1 = w1 - (z1 + 1);
+            w2 = w2 - (z2 + 1);
+            w3 = w3 - (z3 + 1);
             float2 fw0 = {float(w0) * fs, float(w1) * fs};
             float2 fw1 = {float(w2) * fs, float(w3) * fs};
             RB_ptr[0] = __float22half2_rn(fw0);
@@ -725,7 +820,6 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
         }
     }
 
-
 #pragma unroll
     for (size_t k_step = 0; k_step < CHUNK_K; ++k_step) {
         reg_store_idx ^= 1;
@@ -749,27 +843,38 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
         for (size_t j = 0; j < WARP_ROW_TILES; ++j) {
             size_t W_shmem_idx = (warp_id % BLOCK_ROW_WARPS) * WARP_COLS + j * MMA_N + lane_id / 4;
 
-            float fs = __half2float(SHM_SCALES(S_shmem_load_off, W_shmem_idx));
+                float fs = __half2float(SHM_SCALES(S_shmem_load_off, W_shmem_idx));
 
-            TW qw = SHM_WEIGHT(W_shmem_load_off + ((k_step + 1) % CHUNK_K) * MMA_K / n_weights_per_int,  W_shmem_idx);
-            TW qz0 = SHM_ZEROS(Z_shmem_load_off + (K_tiles - (5 - k_step)) * MMA_K / group_size,  (W_shmem_idx)/n_weights_per_int);
+                TW qw = SHM_WEIGHT(W_shmem_load_off + ((k_step + 1) % CHUNK_K) * MMA_K / n_weights_per_int,  W_shmem_idx);
 
-            half2 *RB_ptr = (half2*)&RB[reg_store_idx][j][0];
-            int32_t w0 = (qw >> ((lane_id % 4)*2 * 4)) & B_MASK;
-            int32_t w1 = (qw >> ((lane_id % 4)*2 * 4 + 4)) & B_MASK;
-            int32_t w2 = (qw >> (32 + (lane_id % 4)*2 * 4)) & B_MASK;
-            int32_t w3 = (qw >> (32 + (lane_id % 4)*2*4 + 4)) & B_MASK;
+                int32_t z_id0 = SHM_IDX(I_shmem_load_off, ((k_step + 1) % CHUNK_K) * MMA_K + (lane_id%4) * 2);
+                int32_t z_id1 = SHM_IDX(I_shmem_load_off, ((k_step + 1) % CHUNK_K) * MMA_K + (lane_id%4) * 2 + 1);
+                int32_t z_id2 = SHM_IDX(I_shmem_load_off, ((k_step + 1) % CHUNK_K) * MMA_K + 8 + (lane_id%4) * 2);
+                int32_t z_id3 = SHM_IDX(I_shmem_load_off, ((k_step + 1) % CHUNK_K) * MMA_K + 8 + (lane_id%4) * 2 + 1);
 
-            int32_t z0 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+                TW qz0 = SHM_ZEROS(Z_shmem_load_off + z_id0,  (W_shmem_idx)/n_weights_per_int);
+                TW qz1 = SHM_ZEROS(Z_shmem_load_off + z_id1,  (W_shmem_idx)/n_weights_per_int);
+                TW qz2 = SHM_ZEROS(Z_shmem_load_off + z_id2,  (W_shmem_idx)/n_weights_per_int);
+                TW qz3 = SHM_ZEROS(Z_shmem_load_off + z_id3,  (W_shmem_idx)/n_weights_per_int);
 
-            w0 = w0 - (z0 + 1);
-            w1 = w1 - (z0 + 1);
-            w2 = w2 - (z0 + 1);
-            w3 = w3 - (z0 + 1);
-            float2 fw0 = {float(w0) * fs, float(w1) * fs};
-            float2 fw1 = {float(w2) * fs, float(w3) * fs};
-            RB_ptr[0] = __float22half2_rn(fw0);
-            RB_ptr[1] = __float22half2_rn(fw1);
+                half2 *RB_ptr = (half2*)&RB[reg_store_idx][j][0];
+                int32_t w0 = (qw >> ((lane_id % 4)*2 * 4)) & B_MASK;
+                int32_t w1 = (qw >> ((lane_id % 4)*2 * 4 + 4)) & B_MASK;
+                int32_t w2 = (qw >> (32 + (lane_id % 4)*2 * 4)) & B_MASK;
+                int32_t w3 = (qw >> (32 + (lane_id % 4)*2*4 + 4)) & B_MASK;
+
+                int32_t z0 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+                int32_t z1 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+                int32_t z2 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+                int32_t z3 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+                w0 = w0 - (z0 + 1);
+                w1 = w1 - (z1 + 1);
+                w2 = w2 - (z2 + 1);
+                w3 = w3 - (z3 + 1);
+                float2 fw0 = {float(w0) * fs, float(w1) * fs};
+                float2 fw1 = {float(w2) * fs, float(w3) * fs};
+                RB_ptr[0] = __float22half2_rn(fw0);
+                RB_ptr[1] = __float22half2_rn(fw1);
 
         }
 
@@ -791,6 +896,7 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
             A_shmem_load_off = shmem_load_idx * A_shmem_stage_off;
             W_shmem_load_off = shmem_load_idx * W_shmem_stage_off;
             S_shmem_load_off = shmem_load_idx * S_shmem_stage_off;
+            I_shmem_load_off = shmem_load_idx * I_shmem_stage_off;
             Z_shmem_load_off = shmem_load_idx * Z_shmem_stage_off;
 
             CP_ASYNC_WAIT_GROUP(1);
@@ -819,34 +925,44 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
         }
 
 
-
 #pragma unroll
-    for (size_t j = 0; j < WARP_ROW_TILES; ++j) {
-        size_t W_shmem_idx = (warp_id % BLOCK_ROW_WARPS) * WARP_COLS + j * MMA_N + lane_id / 4;
+        for (size_t j = 0; j < WARP_ROW_TILES; ++j) {
+            size_t W_shmem_idx = (warp_id % BLOCK_ROW_WARPS) * WARP_COLS + j * MMA_N + lane_id / 4;
 
-        float fs = __half2float(SHM_SCALES(S_shmem_load_off, W_shmem_idx));
-        TW qw = SHM_WEIGHT(W_shmem_load_off + ((k_step + 1) % CHUNK_K) * MMA_K / n_weights_per_int ,  W_shmem_idx);
-        TW qz0 = SHM_ZEROS(Z_shmem_load_off + (K_tiles - (3 - k_step)) * MMA_K / group_size,  (W_shmem_idx)/n_weights_per_int);
+            float fs = __half2float(SHM_SCALES(S_shmem_load_off, W_shmem_idx));
+            TW qw = SHM_WEIGHT(W_shmem_load_off + ((k_step + 1) % CHUNK_K) * MMA_K / n_weights_per_int ,  W_shmem_idx);
+
+            int32_t z_id0 = SHM_IDX(I_shmem_load_off, ((k_step + 1) % CHUNK_K) * MMA_K + lane_id%4 * 2);
+            int32_t z_id1 = SHM_IDX(I_shmem_load_off, ((k_step + 1) % CHUNK_K) * MMA_K + lane_id%4 * 2 + 1);
+            int32_t z_id2 = SHM_IDX(I_shmem_load_off, ((k_step + 1) % CHUNK_K) * MMA_K + 8 + lane_id%4 * 2);
+            int32_t z_id3 = SHM_IDX(I_shmem_load_off, ((k_step + 1) % CHUNK_K) * MMA_K + 8 + lane_id%4 * 2 + 1);
 
 
-        half2 *RB_ptr = (half2*)&RB[reg_store_idx][j][0];
-        int32_t w0 = (qw >> ((lane_id % 4)*4*2)) & B_MASK;
-        int32_t w1 = (qw >> ((lane_id % 4)*4*2 + 4)) & B_MASK;
-        int32_t w2 = (qw >> (32 + (lane_id % 4)*4*2)) & B_MASK;
-        int32_t w3 = (qw >> (32 + (lane_id % 4)*4*2 + 4)) & B_MASK;
+            TW qz0 = SHM_ZEROS(Z_shmem_load_off + z_id0,  (W_shmem_idx)/n_weights_per_int);
+            TW qz1 = SHM_ZEROS(Z_shmem_load_off + z_id1,  (W_shmem_idx)/n_weights_per_int);
+            TW qz2 = SHM_ZEROS(Z_shmem_load_off + z_id2,  (W_shmem_idx)/n_weights_per_int);
+            TW qz3 = SHM_ZEROS(Z_shmem_load_off + z_id3,  (W_shmem_idx)/n_weights_per_int);
 
-        int32_t z0 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+            half2 *RB_ptr = (half2*)&RB[reg_store_idx][j][0];
+            int32_t w0 = (qw >> ((lane_id % 4)*4*2)) & B_MASK;
+            int32_t w1 = (qw >> ((lane_id % 4)*4*2 + 4)) & B_MASK;
+            int32_t w2 = (qw >> (32 + (lane_id % 4)*4*2)) & B_MASK;
+            int32_t w3 = (qw >> (32 + (lane_id % 4)*4*2 + 4)) & B_MASK;
 
-        w0 = w0 - (z0 + 1);
-        w1 = w1 - (z0 + 1);
-        w2 = w2 - (z0 + 1);
-        w3 = w3 - (z0 + 1);
-        float2 fw0 = {float(w0) * fs, float(w1) * fs};
-        float2 fw1 = {float(w2) * fs, float(w3) * fs};
-        RB_ptr[0] = __float22half2_rn(fw0);
-        RB_ptr[1] = __float22half2_rn(fw1);
+            int32_t z0 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+            int32_t z1 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+            int32_t z2 = (qz1 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+            int32_t z3 = (qz1 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+            w0 = w0 - (z0 + 1);
+            w1 = w1 - (z1 + 1);
+            w2 = w2 - (z2 + 1);
+            w3 = w3 - (z3 + 1);
+            float2 fw0 = {float(w0) * fs, float(w1) * fs};
+            float2 fw1 = {float(w2) * fs, float(w3) * fs};
+            RB_ptr[0] = __float22half2_rn(fw0);
+            RB_ptr[1] = __float22half2_rn(fw1);
 
-    }
+        }
 
 #pragma unroll
         for (size_t i = 0; i < WARP_COL_TILES; ++i) {
@@ -865,6 +981,7 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
             A_shmem_load_off = shmem_load_idx * A_shmem_stage_off;
             W_shmem_load_off = shmem_load_idx * W_shmem_stage_off;
             S_shmem_load_off = shmem_load_idx * S_shmem_stage_off;
+            I_shmem_load_off = shmem_load_idx * I_shmem_stage_off;
             Z_shmem_load_off = shmem_load_idx * Z_shmem_stage_off;
             CP_ASYNC_WAIT_GROUP(0);
 
@@ -892,33 +1009,43 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
 
 
 #pragma unroll
-    for (size_t j = 0; j < WARP_ROW_TILES; ++j) {
-        size_t W_shmem_idx = (warp_id % BLOCK_ROW_WARPS) * WARP_COLS + j * MMA_N + lane_id / 4;
+        for (size_t j = 0; j < WARP_ROW_TILES; ++j) {
+            size_t W_shmem_idx = (warp_id % BLOCK_ROW_WARPS) * WARP_COLS + j * MMA_N + lane_id / 4;
 
-            float fs = __half2float(SHM_SCALES(S_shmem_load_off, W_shmem_idx));
+                float fs = __half2float(SHM_SCALES(S_shmem_load_off, W_shmem_idx));
 
-            TW qw = SHM_WEIGHT(W_shmem_load_off + k_step*MMA_K / n_weights_per_int,  W_shmem_idx);
+                TW qw = SHM_WEIGHT(W_shmem_load_off + k_step*MMA_K / n_weights_per_int,  W_shmem_idx);
 
-            TW qz0 = SHM_ZEROS(Z_shmem_load_off + (K_tiles - k_step) * MMA_K / group_size,  (W_shmem_idx)/n_weights_per_int);
+                int32_t z_id0 = SHM_IDX(I_shmem_load_off, k_step*MMA_K + (lane_id%4) * 2);
+                int32_t z_id1 = SHM_IDX(I_shmem_load_off, k_step*MMA_K + (lane_id%4) * 2 + 1);
+                int32_t z_id2 = SHM_IDX(I_shmem_load_off, k_step*MMA_K + 8 + (lane_id%4) * 2);
+                int32_t z_id3 = SHM_IDX(I_shmem_load_off, k_step*MMA_K + 8 + (lane_id%4) * 2 + 1);
 
-            half2 *RB_ptr = (half2*)&RB[reg_store_idx][j][0];
-            int32_t w0 = (qw >> ((lane_id % 4)*2 * 4)) & B_MASK;
-            int32_t w1 = (qw >> ((lane_id % 4)*2 * 4 + 4)) & B_MASK;
-            int32_t w2 = (qw >> (32 + (lane_id % 4)*2 * 4)) & B_MASK;
-            int32_t w3 = (qw >> (32 + (lane_id % 4)*2*4 + 4)) & B_MASK;
+                TW qz0 = SHM_ZEROS(Z_shmem_load_off + z_id0,  (W_shmem_idx)/n_weights_per_int);
+                TW qz1 = SHM_ZEROS(Z_shmem_load_off + z_id1,  (W_shmem_idx)/n_weights_per_int);
+                TW qz2 = SHM_ZEROS(Z_shmem_load_off + z_id2,  (W_shmem_idx)/n_weights_per_int);
+                TW qz3 = SHM_ZEROS(Z_shmem_load_off + z_id3,  (W_shmem_idx)/n_weights_per_int);
 
-            int32_t z0 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+                half2 *RB_ptr = (half2*)&RB[reg_store_idx][j][0];
+                int32_t w0 = (qw >> ((lane_id % 4)*2 * 4)) & B_MASK;
+                int32_t w1 = (qw >> ((lane_id % 4)*2 * 4 + 4)) & B_MASK;
+                int32_t w2 = (qw >> (32 + (lane_id % 4)*2 * 4)) & B_MASK;
+                int32_t w3 = (qw >> (32 + (lane_id % 4)*2*4 + 4)) & B_MASK;
 
-            w0 = w0 - (z0 + 1);
-            w1 = w1 - (z0 + 1);
-            w2 = w2 - (z0 + 1);
-            w3 = w3 - (z0 + 1);
-            float2 fw0 = {float(w0) * fs, float(w1) * fs};
-            float2 fw1 = {float(w2) * fs, float(w3) * fs};
-            RB_ptr[0] = __float22half2_rn(fw0);
-            RB_ptr[1] = __float22half2_rn(fw1);
+                int32_t z0 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+                int32_t z1 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+                int32_t z2 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+                int32_t z3 = (qz0 >> ((j * MMA_N + lane_id / 4) % n_weights_per_int * 4)) & B_MASK;
+                w0 = w0 - (z0 + 1);
+                w1 = w1 - (z1 + 1);
+                w2 = w2 - (z2 + 1);
+                w3 = w3 - (z3 + 1);
+                float2 fw0 = {float(w0) * fs, float(w1) * fs};
+                float2 fw1 = {float(w2) * fs, float(w3) * fs};
+                RB_ptr[0] = __float22half2_rn(fw0);
+                RB_ptr[1] = __float22half2_rn(fw1);
 
-    }
+        }
 
 #pragma unroll
         for (size_t i = 0; i < WARP_COL_TILES; ++i) {
@@ -970,9 +1097,12 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
 
 #pragma unroll
     for (size_t i = 0; i < MMA_M; ++i) {
-        *((int4 *)(src_gmem_warp_stream_ptr + (i * 2 + lane_id / 16) * N) + lane_id % 16) =
-            *((int4 *)(shmem_warp_stream_ptr + (i * 2 + lane_id / 16) * C_SHMEM_STRIDE) +
-              (lane_id % 16 + (i * 2 + lane_id / 16) % 8) % (C_SHMEM_STRIDE * sizeof(half) / THREAD_COPY_BYTES));
+        if((uint64_t)src_gmem_warp_stream_ptr < (uint64_t)&C[M*N-1])
+        {
+            *((int4 *)(src_gmem_warp_stream_ptr + (i * 2 + lane_id / 16) * N) + lane_id % 16) =
+                *((int4 *)(shmem_warp_stream_ptr + (i * 2 + lane_id / 16) * C_SHMEM_STRIDE) +
+                (lane_id % 16 + (i * 2 + lane_id / 16) % 8) % (C_SHMEM_STRIDE * sizeof(half) / THREAD_COPY_BYTES));
+        }
     }
 
     __syncthreads();
