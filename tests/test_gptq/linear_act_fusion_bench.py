@@ -233,7 +233,7 @@ if __name__ == "__main__":
     qweight, qscales, qzeros, g_idx = model_cai_pack(linear, quantizers, qweight, qscales, qzeros, args.wbits, args.groupsize)
 
 
-    batch_inps = torch.randn(1, 1024, infeature).to(torch.float16).to(torch.cuda.current_device())
+    batch_inps = torch.randn(1, 4096, infeature).to(torch.float16).to(torch.cuda.current_device())
 
     g_idx = g_idx.to("cuda")
 

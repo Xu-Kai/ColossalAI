@@ -88,7 +88,7 @@
 
 #define AB_SHMEM_STRIDE 32  // CHUNK_K * MMA_K
 
-#define C_SHMEM_STRIDE (BLOCK_COLS)  // 64 BLOCK_COLS
+#define C_SHMEM_STRIDE (BLOCK_COLS)  // 128 BLOCK_COLS
 #define C_SHMEM_OFFSET (WARP_COLS)   // 64 WARP_COLS
 
 #define BLOCK_STRIDE 16
@@ -108,6 +108,17 @@ inline __device__ __host__ static size_t div_ceil(size_t a, size_t b) {
     return (a % b != 0) ? (a / b + 1) : (a / b);
 }
 
+inline __device__ float relu(const float x) { return x < 0 ? 0 : x; }
+inline __device__ float gelu(const float x)
+{
+    const float sqrt_param = 0.79788456080286535587989211986876f;
+    const float mul_param  = 0.044715;
+    return x * 0.5f * (1.0f + tanhf(sqrt_param * (x + mul_param * x * x * x)));
+}
+inline __device__ float silu(const float x)
+{
+    return x  / (1 + expf(-x));
+}
 
 template <typename T, typename TW, int W_BITS=4>
 __global__ static void gptq_bgemm_final(const T *__restrict__  A,
@@ -116,7 +127,7 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
                             TW* weight_zeros,
                             int32_t* idx,
                             T* bias,
-                            T* residual_ptr,
+                            T* residual,
                             T*__restrict__ C,
                             size_t M, 
                             size_t N, 
@@ -136,9 +147,13 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
     const size_t warp_id = threadIdx.x / WARP_SIZE;
     const size_t lane_id = threadIdx.x % WARP_SIZE;
 
+    const size_t grid_dim_z = div_ceil(N, BLOCK_COLS * BLOCK_STRIDE);
+    const size_t qkv_offset = blockIdx.z / grid_dim_z; 
+    const size_t block_id_z = blockIdx.z % grid_dim_z;
+
     const size_t block_tile_i = 
         (blockIdx.z % 2) ? ((gridDim.y - blockIdx.y - 1) * BLOCK_COL_TILES) : (blockIdx.y * BLOCK_COL_TILES);
-    const size_t block_tile_j = (blockIdx.z * gridDim.x + blockIdx.x) * BLOCK_ROW_TILES;
+    const size_t block_tile_j = (block_id_z * gridDim.x + blockIdx.x) * BLOCK_ROW_TILES;
 
     if (block_tile_i >= M_tiles || block_tile_j >= N_tiles) {
         return;
@@ -164,39 +179,18 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
  #define SHM_ZEROS(i, j) (shm_zeros_ptr[(i) * BLOCK_COLS/n_weights_per_int + (j)])
  #define DEBUG_ADDR(i, j, s) {} //if ((uint64_t) i > (uint64_t)j) { printf("wrong addrs: %s\n", s);}
 
-
-    size_t lanes_per_zk_row = BLOCK_COLS / 2 / THREAD_COPY_BYTES;
-    size_t warp_zk_row_per_iter = WARP_SIZE / lanes_per_zk_row;
-    size_t z_cols_per_lane = THREAD_COPY_BYTES / sizeof(TW);
     TW* zeros_ptr = weight_zeros + block_tile_j * MMA_N / n_weights_per_int;
-    // for(size_t i = 0; i < K / group_size; i += WARPS_PER_BLOCK)
-    // {
-    //     if( i * warp_zk_row_per_iter < K / group_size)
-    //     {
-    //         size_t Z_shmem_idx = i * warp_zk_row_per_iter + lane_id / lanes_per_zk_row;
-    //         int4* Z_lane_ptr = (int4*)(zeros_ptr 
-    //                         +  (i *warp_zk_row_per_iter + lane_id / lanes_per_zk_row) * ( N / n_weights_per_int) 
-    //                         +  lane_id % lanes_per_zk_row * z_cols_per_lane);
-    //         uint32_t Z_shmem_lane_addr = __cvta_generic_to_shared(&SHM_ZEROS(Z_shmem_idx,
-    //                                             lane_id % lanes_per_zk_row * z_cols_per_lane));
-    //         CP_ASYNC_CG(Z_shmem_lane_addr, Z_lane_ptr, THREAD_COPY_BYTES);
-    //     }  
-    // }
-    if(warp_id == 0)
-    {
-        for(size_t i = 0; i < K / group_size; i += 1)
-        {
+    size_t lanes_per_zk_row = BLOCK_COLS * W_BITS  / 8 / THREAD_COPY_BYTES;
+    
 
-            if(lane_id < BLOCK_COLS/n_weights_per_int)
-            {
-                SHM_ZEROS(i, lane_id) = zeros_ptr[i * N / n_weights_per_int + lane_id];
-            }
+    for(size_t i = 0; i < K / group_size; i += THREADS_PER_BLOCK / lanes_per_zk_row)
+    {
+        if(i + threadIdx.x / lanes_per_zk_row  < K / group_size)
+        {
+            *(((int4*)&SHM_ZEROS(i + threadIdx.x / lanes_per_zk_row , 0)) + (lane_id % lanes_per_zk_row)) = 
+                *(((int4*)(zeros_ptr + (i + threadIdx.x / lanes_per_zk_row) * N / n_weights_per_int)) + (lane_id % lanes_per_zk_row));
         }
     }
-
-
-    CP_ASYNC_COMMIT_GROUP();
-    CP_ASYNC_WAIT_GROUP(0);
     __syncthreads();
 
     const size_t shm_weight_off = 0;
@@ -247,7 +241,9 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
     const half *shmem_warp_stream_ptr = &shmem[0][0] + warp_id * MMA_M * 2 * C_SHMEM_STRIDE;
 
     const size_t gmem_idx = (block_tile_i * MMA_M + warp_id * MMA_M * 2) * N + block_tile_j * MMA_N;
-    const half *src_gmem_warp_stream_ptr = &C[gmem_idx];
+    const half *src_gmem_warp_stream_ptr = &C[qkv_offset * M * N + gmem_idx];
+    const T *residual_ptr = &residual[gmem_idx];
+    const T *bias_ptr = &bias[qkv_offset * N + block_tile_j * MMA_N];
 
     uint32_t RC[WARP_COL_TILES][WARP_ROW_TILES][2];
 
@@ -280,16 +276,19 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
 
 #pragma unroll
     for (size_t i = 0; i < A_shmem_iters; ++i) {
-        uint32_t A_shmem_lane_addr = __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
-                                     ((lane_id % CHUNK_COPY_LINE_LANES +
-                                       (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
-                                      CHUNK_COPY_LINE_LANES) *
-                                         THREAD_COPY_BYTES;
+        if((uint64_t)A_lane_ptr < (uint64_t)&A[M*K-1])
+        {
+            uint32_t A_shmem_lane_addr = __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
+                                        ((lane_id % CHUNK_COPY_LINE_LANES +
+                                        (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
+                                        CHUNK_COPY_LINE_LANES) *
+                                            THREAD_COPY_BYTES;
 
-        CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
+            CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
 
-        A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
-        A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+            A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
+            A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+        }
     }
 
     W_shmem_store_off = 0;
@@ -336,16 +335,19 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
 
 #pragma unroll
     for (size_t i = 0; i < A_shmem_iters; ++i) {
-        uint32_t A_shmem_lane_addr = __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
-                                     ((lane_id % CHUNK_COPY_LINE_LANES +
-                                       (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
-                                      CHUNK_COPY_LINE_LANES) *
-                                         THREAD_COPY_BYTES;
+        if((uint64_t)A_lane_ptr < (uint64_t)&A[M*K-1])
+        {
+            uint32_t A_shmem_lane_addr = __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
+                                        ((lane_id % CHUNK_COPY_LINE_LANES +
+                                        (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
+                                        CHUNK_COPY_LINE_LANES) *
+                                            THREAD_COPY_BYTES;
 
-        CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
+            CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
 
-        A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
-        A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+            A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
+            A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+        }
     }
 
     W_shmem_store_off = shmem_store_idx * W_shmem_stage_off;
@@ -396,16 +398,19 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
 
 #pragma unroll
     for (size_t i = 0; i < A_shmem_iters; ++i) {
-        uint32_t A_shmem_lane_addr = __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
-                                     ((lane_id % CHUNK_COPY_LINE_LANES +
-                                       (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
-                                      CHUNK_COPY_LINE_LANES) *
-                                         THREAD_COPY_BYTES;
+        if((uint64_t)A_lane_ptr < (uint64_t)&A[M*K-1])
+        {
+            uint32_t A_shmem_lane_addr = __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
+                                        ((lane_id % CHUNK_COPY_LINE_LANES +
+                                        (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
+                                        CHUNK_COPY_LINE_LANES) *
+                                            THREAD_COPY_BYTES;
 
-        CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
+            CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
 
-        A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
-        A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+            A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
+            A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+        }
     }
 
     W_shmem_store_off = shmem_store_idx * W_shmem_stage_off;
@@ -589,17 +594,20 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
 
 #pragma unroll
         for (size_t i = 0; i < A_shmem_iters / CHUNK_K; ++i) {
-            uint32_t A_shmem_lane_addr =
-                __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
-                ((lane_id % CHUNK_COPY_LINE_LANES +
-                  (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
-                 CHUNK_COPY_LINE_LANES) *
-                    THREAD_COPY_BYTES;
+            if((uint64_t)A_lane_ptr < (uint64_t)&A[M*K-1])
+            {
+                uint32_t A_shmem_lane_addr =
+                    __cvta_generic_to_shared(&shmem[A_shmem_idx][0]) +
+                    ((lane_id % CHUNK_COPY_LINE_LANES +
+                    (A_shmem_idx % (CHUNK_COPY_LINE_LANES * SHMEM_BANK_ROWS)) / SHMEM_BANK_ROWS) %
+                    CHUNK_COPY_LINE_LANES) *
+                        THREAD_COPY_BYTES;
 
-            CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
+                CP_ASYNC_CG(A_shmem_lane_addr, A_lane_ptr, THREAD_COPY_BYTES);
 
-            A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
-            A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+                A_lane_ptr = (int4 *)((half *)A_lane_ptr + CHUNK_COPY_LINES_PER_WARP * K);
+                A_shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+            }
         }
 
         W_shmem_store_off = shmem_store_idx * W_shmem_stage_off;
@@ -970,18 +978,40 @@ __global__ static void gptq_bgemm_final(const T *__restrict__  A,
 
 #pragma unroll
     for (size_t i = 0; i < MMA_M; ++i) {
-        *((int4 *)(src_gmem_warp_stream_ptr + (i * 2 + lane_id / 16) * N) + lane_id % 16) =
-            *((int4 *)(shmem_warp_stream_ptr + (i * 2 + lane_id / 16) * C_SHMEM_STRIDE) +
-              (lane_id % 16 + (i * 2 + lane_id / 16) % 8) % (C_SHMEM_STRIDE * sizeof(half) / THREAD_COPY_BYTES));
+        if((uint64_t)src_gmem_warp_stream_ptr < (uint64_t)&C[M*N - 1])
+        {
+            half* shem_c_local =  (half*)((int4 *)(shmem_warp_stream_ptr + (i * 2 + lane_id / 16) * C_SHMEM_STRIDE) + 
+                (lane_id % 16 + (i * 2 + lane_id / 16) % 8) % (C_SHMEM_STRIDE * sizeof(half) / THREAD_COPY_BYTES));
+            half* c_local = (half*)((src_gmem_warp_stream_ptr + (i * 2 + lane_id / 16) * N) 
+                                    + (lane_id % 16) * THREAD_COPY_BYTES / sizeof(half));
+            const half* bias_local = bias_ptr + lane_id % 16 * THREAD_COPY_BYTES / sizeof(half);
+            half* residual_local = (half*)((int4 *)(residual_ptr + (i * 2 + lane_id / 16) * N) + lane_id % 16);
+            for(size_t j = 0; j < THREAD_COPY_BYTES / sizeof(half); j ++)
+            {
+                if(add_bias)
+                    shem_c_local[j] += bias_local[j];
+
+                if(act_type == 1)
+                    shem_c_local[j] = __float2half_rn(relu(__half2float(shem_c_local[j])));
+                else if(act_type == 2)
+                    shem_c_local[j] = __float2half_rn(gelu(__half2float(shem_c_local[j])));
+                else if(act_type == 3)
+                    shem_c_local[j] = __float2half_rn(silu(__half2float(shem_c_local[j])));
+
+                if(add_residual)
+                    shem_c_local[j] += residual_local[j];
+        
+            }
+
+            *((int4 *)c_local) =
+                *((int4 *)shem_c_local);
+        }
     }
 
     __syncthreads();
 }
 
 
-
-
-	
 static size_t initMmaAsyncStage4() {
     int dev_id = 0;
     cudaGetDevice(&dev_id);
@@ -998,14 +1028,6 @@ static size_t initMmaAsyncStage4() {
 
     size_t shmem_max_size = std::max(shm_size,
                                      BLOCK_ROWS * C_SHMEM_STRIDE * sizeof(half));
-
-    // __shared__ half shmem[K_STAGE * BLOCK_ROWS][AB_SHMEM_STRIDE];
-
-    // __shared__ TW shm_qweight [AB_SHMEM_STRIDE/CHUNK_K][BLOCK_COLS];
-    // __shared__ half shm_scales [K_STAGE][BLOCK_COLS];
-    // __shared__ int32_t shm_idx [K_STAGE][AB_SHMEM_STRIDE];
-    // __shared__ TW shm_zeros [128][BLOCK_COLS/n_weights_per_int];
-
 
     printf("shmem_max_size: %.0f KBytes (%zu Bytes)\n", static_cast<float>(shmem_max_size / 1024.0f), shmem_max_size);
 

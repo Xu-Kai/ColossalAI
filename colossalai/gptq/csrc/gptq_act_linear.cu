@@ -12,17 +12,17 @@
 // #include "gptq_hemm_v3.h"
 
 #define SHARE_MEM_SIZE (48 *  1024)
-inline __device__ float relu(const float x) { return x < 0 ? 0 : x; }
-inline __device__ float gelu(const float x)
-{
-    const float sqrt_param = 0.79788456080286535587989211986876f;
-    const float mul_param  = 0.044715;
-    return x * 0.5f * (1.0f + tanhf(sqrt_param * (x + mul_param * x * x * x)));
-}
-inline __device__ float silu(const float x)
-{
-    return x  / (1 + expf(-x));
-}
+// inline __device__ float relu(const float x) { return x < 0 ? 0 : x; }
+// inline __device__ float gelu(const float x)
+// {
+//     const float sqrt_param = 0.79788456080286535587989211986876f;
+//     const float mul_param  = 0.044715;
+//     return x * 0.5f * (1.0f + tanhf(sqrt_param * (x + mul_param * x * x * x)));
+// }
+// inline __device__ float silu(const float x)
+// {
+//     return x  / (1 + expf(-x));
+// }
 /***
 input: the input size is [b, l, m]
 weight: the weight size is [m/size(TW)*2, n]
@@ -230,9 +230,6 @@ __global__ void gptq_gemm(T* input,
 
     }  
 }
-
-
-
 
 
 

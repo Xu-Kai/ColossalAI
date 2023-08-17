@@ -226,11 +226,11 @@ if __name__ == "__main__":
     act_func = nn.SiLU()
 
     inps = torch.ones(1, 1, infeature).to(torch.float16).to(torch.cuda.current_device())
-    batch_inps = torch.zeros(1, 1024, infeature).to(torch.float16).to(torch.cuda.current_device())
-    one_inps = torch.ones(1024).to(torch.float16).to(torch.cuda.current_device())
+    batch_inps = torch.zeros(1, 1027, infeature).to(torch.float16).to(torch.cuda.current_device())
+    one_inps = torch.ones(1027).to(torch.float16).to(torch.cuda.current_device())
     batch_inps = batch_inps.transpose(1, 2)
 
-    batch_inps[:, (infeature - 3072):infeature, :] = one_inps
+    batch_inps[:, :infeature, :] = one_inps
     # batch_inps[0][0][1] = 2.0
     # batch_inps[0][0][2] = 3.0
     # batch_inps[0][0][3] = 4.0
@@ -288,9 +288,10 @@ if __name__ == "__main__":
                             qzeros,
                             g_idx=g_idx,
                             bias = bias, 
-                            act_type = 3,
+                            act_type = 0,
                             qkv_fused=qkv_fused)
         torch.cuda.synchronize()
+
 
         batch_cai_out = cai_linear(batch_inps,
                             qweight,
@@ -298,7 +299,7 @@ if __name__ == "__main__":
                             qzeros,
                             g_idx=g_idx,
                             bias=bias,
-                            act_type = 3,
+                            act_type = 0,
                             qkv_fused=qkv_fused)
         torch.cuda.synchronize()
         # batch_gptq_out = act_func(batch_gptq_out)
