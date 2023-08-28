@@ -1,5 +1,6 @@
 import warnings
 
+import torch
 import torch.distributed as dist
 
 HAS_AUTO_GPTQ = False
@@ -11,13 +12,16 @@ except ImportError:
     HAS_AUTO_GPTQ = False
 
 from .cai_gptq import CaiQuantLinear
-from .models import GPTQBloomConfig, GPTQLlamaConfig
+from .models import GPTQBloomConfig, GPTQLlamaConfig, reset_bloom_attention_params, reset_llama_attention_params
 
 model_config_map = {
     "llama": GPTQLlamaConfig,
     "bloom": GPTQBloomConfig,
 }
-
+attention_proc_map = {
+    "llama": reset_llama_attention_params,
+    "bloom": reset_bloom_attention_params,
+}
 if HAS_AUTO_GPTQ:
 
     def get_module_by_name_prefix(model, module_name: str):
@@ -94,11 +98,20 @@ if HAS_AUTO_GPTQ:
         layers = get_module_by_name_prefix(model.model, gptq_model_config.layer_blocks)
 
         for layer in layers:
+
+            attention_proc_map[model_type_name](layer, tp_size=tp_size)
             for linear_name in gptq_model_config.linear_names[0]:
                 gptq_linear = get_module_by_name_prefix(layer, linear_name)
                 #column split copy
-                cai_linear = CaiQuantLinear(gptq_linear.bits, gptq_linear.group_size, gptq_linear.in_features,
-                                            gptq_linear.out_features // tp_size, gptq_linear.bias is not None)
+                cai_linear = CaiQuantLinear(
+                    gptq_linear.bits,
+                    gptq_linear.group_size,
+                    gptq_linear.in_features,
+                    gptq_linear.out_features // tp_size,
+                    gptq_linear.bias is not None,
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
+                )
                 cai_linear.to(gptq_linear.qweight.device)
                 if len(gptq_model_config.linear_names[0]) == 1:
                     split_column_copy(gptq_linear, cai_linear, tp_size=tp_size, tp_rank=tp_rank, split_num=3)
@@ -116,12 +129,14 @@ if HAS_AUTO_GPTQ:
                                             gptq_linear.in_features // tp_size,
                                             gptq_linear.out_features,
                                             gptq_linear.bias is not None,
+                                            tp_size=tp_size,
+                                            tp_rank=tp_rank,
                                             row_split=True)
                 cai_linear.to(gptq_linear.qweight.device)
                 split_row_copy(gptq_linear, cai_linear, tp_size=tp_size, tp_rank=tp_rank)
 
                 if tp_size > 1:
-                    torch.register_forward_hook(cai_linear, all_reduce_hook)
+                    cai_linear.register_forward_hook(all_reduce_hook)
                 name1, name2 = linear_name.split(".")
                 parent_module = get_module_by_name_prefix(layer, name1)
                 setattr(parent_module, name2, cai_linear)
@@ -129,8 +144,15 @@ if HAS_AUTO_GPTQ:
             for linear_name in gptq_model_config.linear_names[2]:
                 gptq_linear = get_module_by_name_prefix(layer, linear_name)
                 #column split copy
-                cai_linear = CaiQuantLinear(gptq_linear.bits, gptq_linear.group_size, gptq_linear.in_features,
-                                            gptq_linear.out_features // tp_size, gptq_linear.bias is not None)
+                cai_linear = CaiQuantLinear(
+                    gptq_linear.bits,
+                    gptq_linear.group_size,
+                    gptq_linear.in_features,
+                    gptq_linear.out_features // tp_size,
+                    gptq_linear.bias is not None,
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
+                )
                 cai_linear.to(gptq_linear.qweight.device)
                 split_column_copy(gptq_linear, cai_linear, tp_size=tp_size, tp_rank=tp_rank)
                 name1, name2 = linear_name.split(".")
@@ -145,12 +167,14 @@ if HAS_AUTO_GPTQ:
                                             gptq_linear.in_features // tp_size,
                                             gptq_linear.out_features,
                                             gptq_linear.bias is not None,
+                                            tp_size=tp_size,
+                                            tp_rank=tp_rank,
                                             row_split=True)
                 cai_linear.to(gptq_linear.qweight.device)
                 split_row_copy(gptq_linear, cai_linear, tp_size=tp_size, tp_rank=tp_rank)
 
                 if tp_size > 1:
-                    torch.register_forward_hook(cai_linear, all_reduce_hook)
+                    cai_linear.register_forward_hook(all_reduce_hook)
                 name1, name2 = linear_name.split(".")
                 parent_module = get_module_by_name_prefix(layer, name1)
                 setattr(parent_module, name2, cai_linear)

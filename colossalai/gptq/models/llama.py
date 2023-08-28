@@ -10,3 +10,10 @@ class GPTQLlamaConfig():
     model_names = ["model.embed_tokens", "model.norm"]
     attention = "self_attn"
     mlp = "mlp"
+
+
+def reset_llama_attention_params(layer, tp_size=1):
+    attention = getattr(layer, "self_attn")
+    attention.hidden_size = attention.hidden_size // tp_size
+    attention.num_heads = attention.num_heads // tp_size
+    attention.num_key_value_heads = attention.num_key_value_heads // tp_size

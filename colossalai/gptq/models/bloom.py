@@ -10,3 +10,9 @@ class GPTQBloomConfig():
     model_names = ["transformer.word_embeddings", "transformer.word_embeddings_layernorm", "transformer.ln_f"]
     attention = "self_attention"
     mlp = "mlp"
+
+
+def reset_bloom_attention_params(layer, tp_size=1):
+    attention = getattr(layer, "self_attention")
+    attention.hidden_size = attention.hidden_size // tp_size
+    attention.num_heads = attention.num_heads // tp_size

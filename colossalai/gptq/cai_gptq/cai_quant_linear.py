@@ -46,7 +46,14 @@ class CaiQuantLinear(nn.Module):
             torch.zeros((math.ceil(infeatures / self.groupsize), outfeatures // 32 * self.bits), dtype=torch.int32))
         self.register_buffer('scales',
                              torch.zeros((math.ceil(infeatures / self.groupsize), outfeatures), dtype=torch.float16))
-        self.register_buffer('g_idx', torch.tensor([i // self.groupsize for i in range(infeatures)], dtype=torch.int32))
+        if row_split:
+            self.register_buffer(
+                'g_idx',
+                torch.tensor([(i + (tp_rank * self.infeatures)) // self.groupsize for i in range(infeatures)],
+                             dtype=torch.int32))
+        else:
+            self.register_buffer('g_idx',
+                                 torch.tensor([i // self.groupsize for i in range(infeatures)], dtype=torch.int32))
 
         if bias:
             self.register_buffer('bias', torch.zeros((outfeatures), dtype=torch.float16))
@@ -147,10 +154,10 @@ class CaiQuantLinear(nn.Module):
         if self.g_idx is not None:
             if self.row_split and torch.equal(
                     self.g_idx,
-                    torch.tensor([(i + (self.tp_rank * self.infeatures // self.tp_size)) // self.groupsize
-                                  for i in range(self.infeatures // self.tp_size)],
-                                 dtype=torch.int32,
-                                 device=self.g_idx.device)):
+                    torch.tensor(
+                        [(i + (self.tp_rank * self.infeatures)) // self.groupsize for i in range(self.infeatures)],
+                        dtype=torch.int32,
+                        device=self.g_idx.device)):
                 self.g_idx = None
             elif torch.equal(
                     self.g_idx,
@@ -189,10 +196,10 @@ class CaiQuantLinear(nn.Module):
         if self.g_idx is not None:
             if self.row_split and torch.equal(
                     self.g_idx,
-                    torch.tensor([(i + (self.tp_rank * self.infeatures // self.tp_size)) // self.groupsize
-                                  for i in range(self.infeatures // self.tp_size)],
-                                 dtype=torch.int32,
-                                 device=self.g_idx.device)):
+                    torch.tensor(
+                        [(i + (self.tp_rank * self.infeatures)) // self.groupsize for i in range(self.infeatures)],
+                        dtype=torch.int32,
+                        device=self.g_idx.device)):
                 self.g_idx = None
             elif torch.equal(
                     self.g_idx,
