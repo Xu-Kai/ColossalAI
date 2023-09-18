@@ -18,7 +18,7 @@ from colossalai.testing import clear_cache_before_run, parameterize, rerun_if_ad
 os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = 'true'
 TPSIZE = 1
 BATCH_SIZE = 8
-MAX_INPUT_LEN = 12
+MAX_INPUT_LEN = 64
 MAX_OUTPUT_LEN = 100
 CUDA_SUPPORT = version.parse(torch.version.cuda) > version.parse('11.5')
 
@@ -38,18 +38,18 @@ def run_chatglm2_test(test_config):
     #init_to_get_rotary(model.model, base=10000)
     model = model.half()
 
-    text = ["how is weather today?", "i am "]
+    text = ["how is the weather today?","你叫什么名字","你在做什么？"]
     input_ids = tokenizer.batch_encode_plus(text, return_tensors='pt', padding=True)
     shard_config = ShardConfig(enable_tensor_parallelism=True if test_config['tp_size'] > 1 else False,
                                inference_only=True)
+    generate_kwargs = dict(max_new_tokens=MAX_OUTPUT_LEN, do_sample=False)
+
     #print("input ids ", input_ids)
     infer_engine = TPInferEngine(model, shard_config, BATCH_SIZE, MAX_INPUT_LEN, MAX_OUTPUT_LEN)
+    outputs = infer_engine.generate(input_ids.to("cuda"), **generate_kwargs)
+    # infer_engine = model.cuda()
+    # outputs = infer_engine.generate(**input_ids.to("cuda"), **generate_kwargs)
 
-    generate_kwargs = dict(max_new_tokens=MAX_OUTPUT_LEN, do_sample=False)
-    outputs = infer_engine.generate(input_ids, **generate_kwargs)
-    print("outputs.shape: ", outputs[0].shape)
-
-    print("outputs: ", outputs[0])
     if not dist.is_initialized() or dist.get_rank() == 0:
         for o in outputs:
             output_text = tokenizer.decode(o)

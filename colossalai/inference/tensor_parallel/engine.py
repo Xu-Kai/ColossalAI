@@ -61,12 +61,13 @@ class TPInferEngine:
 
         self.dtype = dtype
 
+        print("model_config: ", model.config)
         self.head_dim = model.config.hidden_size // model.config.num_attention_heads
         self.head_num = model.config.num_attention_heads
         num_hidden_layers = model.config.num_hidden_layers if hasattr(model.config, "num_hidden_layers") \
             else model.config.num_layers
         self.layer_num = num_hidden_layers
-
+        self.multi_query_group_num = model.config.multi_query_group_num
         self.tp_size = -1    # to be set with given shard config in self.prepare_shard_config
         self.cache_manager = None
 
@@ -78,8 +79,8 @@ class TPInferEngine:
     def _init_manager(self) -> None:
         assert self.tp_size >= 1, "TP size not initialized without providing a valid ShardConfig"
         assert self.head_num % self.tp_size == 0, f"Cannot shard {self.head_num} heads with tp size {self.tp_size}"
-        self.head_num //= self.tp_size    # update sharded number of heads
-        self.cache_manager = MemoryManager(self.max_total_token_num, self.dtype, self.head_num, self.head_dim,
+        self.head_num //= self.tp_size    # update sharded number of heads self.multi_query_group_num
+        self.cache_manager = MemoryManager(self.max_total_token_num, self.dtype, self.multi_query_group_num, self.head_dim,
                                            self.layer_num)
 
     def _optimize_model(self, model: nn.Module) -> None:
