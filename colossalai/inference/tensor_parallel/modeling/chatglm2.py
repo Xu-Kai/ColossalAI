@@ -9,7 +9,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from colossalai.inference.tensor_parallel.batch_infer_state import BatchInferState
 from colossalai.kernel.triton.context_attention import llama2_context_attn_fwd
 from colossalai.kernel.triton.copy_kv_cache_dest import copy_kv_cache_to_dest
-from colossalai.kernel.triton.rotary_embedding_kernel import rotary_embedding_fwd
+from colossalai.kernel.triton.rotary_embedding_kernel import llama2_rotary_embedding_fwd
 from colossalai.kernel.triton.token_attention_kernel import Llama2TokenAttentionForwards
 from colossalai.shardformer.modeling.chatglm2_6b.modeling_chatglm import (
     ChatGLMForConditionalGeneration,
@@ -165,17 +165,16 @@ class ChatGLM2InferenceForwards:
 
         #related to rotary embedding
         if infer_state.is_context_stage:
-            
+
             infer_state.position_cos = torch.index_select(self._cos_cached, 0, position_ids.view(-1)).view(
                 position_ids.view(-1).shape[0], -1)
             infer_state.position_sin = torch.index_select(self._sin_cached, 0, position_ids.view(-1)).view(
                 position_ids.view(-1).shape[0], -1)
 
-
         else:
             seq_len = infer_state.seq_len
-            infer_state.position_cos = torch.index_select(self._cos_cached, 0, seq_len-1).view(seq_len.shape[0], -1)
-            infer_state.position_sin = torch.index_select(self._sin_cached, 0, seq_len-1).view(seq_len.shape[0], -1)
+            infer_state.position_cos = torch.index_select(self._cos_cached, 0, seq_len - 1).view(seq_len.shape[0], -1)
+            infer_state.position_sin = torch.index_select(self._sin_cached, 0, seq_len - 1).view(seq_len.shape[0], -1)
             infer_state.other_kv_index = infer_state.block_loc[0, infer_state.max_len_in_batch].item()
 
         transformer_outputs = self.transformer(input_ids=input_ids,
@@ -272,14 +271,13 @@ class ChatGLM2InferenceForwards:
         else:
             rotary_pos_emb = rotary_pos_emb[:, :seq_length]
 
-
         rotary_pos_emb = rotary_pos_emb.transpose(0, 1).contiguous()
 
         # Run encoder.
         hidden_states, presents, all_hidden_states, all_self_attentions = self.encoder(
             inputs_embeds,
             full_attention_mask,
-            # rotary_pos_emb=rotary_pos_emb,
+        # rotary_pos_emb=rotary_pos_emb,
             kv_caches=past_key_values,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
@@ -311,7 +309,7 @@ class ChatGLM2InferenceForwards:
         self: GLMTransformer,
         hidden_states,
         attention_mask,
-        # rotary_pos_emb,
+    # rotary_pos_emb,
         kv_caches=None,
         use_cache: Optional[bool] = True,
         output_hidden_states: Optional[bool] = False,
@@ -450,14 +448,14 @@ class ChatGLM2InferenceForwards:
 
         cos, sin = infer_state.position_cos, infer_state.position_sin
 
-        rotary_embedding_fwd(
+        llama2_rotary_embedding_fwd(
             query_layer.view(-1, self.num_attention_heads_per_partition, self.hidden_size_per_attention_head), cos, sin)
         if self.multi_query_attention:
-            rotary_embedding_fwd(
+            llama2_rotary_embedding_fwd(
                 key_layer.view(-1, self.num_multi_query_groups_per_partition, self.hidden_size_per_attention_head), cos,
                 sin)
         else:
-            rotary_embedding_fwd(
+            llama2_rotary_embedding_fwd(
                 key_layer.view(-1, self.num_attention_heads_per_partition, self.hidden_size_per_attention_head), cos,
                 sin)
         #The shape of key value pair will return to [sq, b , num_heads, num_hidden_size] after rotary embedding, the logic is kept same as original
@@ -465,7 +463,8 @@ class ChatGLM2InferenceForwards:
         # reshape q k v  to [bsz*sql, num_heads, head_dim] num_multi_query_groups_per_partition
         query_layer = query_layer.reshape(-1, self.num_attention_heads_per_partition,
                                           self.hidden_size_per_attention_head)
-        key_layer = key_layer.reshape(-1, self.num_multi_query_groups_per_partition, self.hidden_size_per_attention_head)
+        key_layer = key_layer.reshape(-1, self.num_multi_query_groups_per_partition,
+                                      self.hidden_size_per_attention_head)
         value_layer = value_layer.reshape(-1, self.num_multi_query_groups_per_partition,
                                           self.hidden_size_per_attention_head)
 
@@ -509,17 +508,18 @@ class ChatGLM2InferenceForwards:
             # ==================================
             # core attention computation is replaced by triton kernel
             # ==================================
-            Llama2TokenAttentionForwards.token_attn(query_layer,  infer_state.cache_manager.key_buffer[infer_state.decode_layer_id],
-                                infer_state.cache_manager.value_buffer[infer_state.decode_layer_id], attn_output, infer_state.block_loc,
-                                                    infer_state.start_loc, infer_state.seq_len,
-                                                    infer_state.seq_length_with_past, infer_state.other_kv_index)
+            Llama2TokenAttentionForwards.token_attn(query_layer,
+                                                    infer_state.cache_manager.key_buffer[infer_state.decode_layer_id],
+                                                    infer_state.cache_manager.value_buffer[infer_state.decode_layer_id],
+                                                    attn_output, infer_state.block_loc, infer_state.start_loc,
+                                                    infer_state.seq_len, infer_state.seq_length_with_past,
+                                                    infer_state.other_kv_index)
 
         # =================
         # Output:[sq, b, h] ,it is kept same as original.
         # =================
 
         attn_output = attn_output.view(batch_size, -1, self.projection_size).transpose(0, 1).contiguous()
-
 
         output = self.dense(attn_output)
         return output, kv_cache

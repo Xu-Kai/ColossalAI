@@ -80,8 +80,8 @@ class TPInferEngine:
         assert self.tp_size >= 1, "TP size not initialized without providing a valid ShardConfig"
         assert self.head_num % self.tp_size == 0, f"Cannot shard {self.head_num} heads with tp size {self.tp_size}"
         self.head_num //= self.tp_size    # update sharded number of heads self.multi_query_group_num
-        self.cache_manager = MemoryManager(self.max_total_token_num, self.dtype, self.multi_query_group_num, self.head_dim,
-                                           self.layer_num)
+        self.cache_manager = MemoryManager(self.max_total_token_num, self.dtype, self.multi_query_group_num,
+                                           self.head_dim, self.layer_num)
 
     def _optimize_model(self, model: nn.Module) -> None:
         """

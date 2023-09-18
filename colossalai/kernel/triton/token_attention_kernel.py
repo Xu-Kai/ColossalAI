@@ -680,7 +680,7 @@ class Llama2TokenAttentionForwards:
     @torch.no_grad()
     def token_attn(q, k, v, attn_out, kv_cache_loc, kv_cache_start_loc, kv_cache_seq_len, max_len_in_batch,
                    other_kv_index):
-        
+
         total_token_num = k.shape[0]
         head_num = q.shape[1]
         batch_size = kv_cache_seq_len.shape[0]
