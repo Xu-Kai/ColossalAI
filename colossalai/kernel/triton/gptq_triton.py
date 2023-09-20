@@ -409,7 +409,7 @@ def cai_gptq_idx_matmul_248_kernel(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr, i
     shifter = (offs_k % infearure_per_bits) * bits
     zeros_shifter = (offs_bn % infearure_per_bits) * bits
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    g_ptrs = idx_ptr + offs_bk
+    g_ptrs = idx_ptr + offs_k
     g_idx = tl.load(g_ptrs)
     # tl.device_print("gidx, ", g_idx)
     zeros_ptrs = zeros_ptr + (offs_bn[None, :] // infearure_per_bits)
