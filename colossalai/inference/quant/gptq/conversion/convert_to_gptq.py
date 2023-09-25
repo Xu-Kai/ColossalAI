@@ -29,7 +29,6 @@ from ._utils import (
     make_sure_no_tensor_in_meta_device,
     move_to_device,
     pack_model,
-    simple_dispatch_model,
 )
 from .gptq import GPTQ
 
@@ -212,7 +211,6 @@ def quantize(model: PreTrainedModel,
              quantize_config: GPTQQuantizeConfig,
              examples: List[Dict[str, Union[List[int], torch.LongTensor]]],
              batch_size: int = 1,
-             use_triton: bool = False,
              use_cuda_fp16: bool = True,
              autotune_warmup_after_quantized: bool = False,
              cache_examples_on_gpu: bool = True):
@@ -602,6 +600,7 @@ def load_quantized(model_name_or_path: Optional[str],
         )
         model.tie_weights()
 
+    print("model name:", dir(model))
     # == step3: load checkpoint and dispatch == #
     if isinstance(device_map, str) and device_map not in ["auto", "balanced", "balanced_low_0", "sequential"]:
         raise ValueError("If passing a string for `device_map`, please choose 'auto', 'balanced', 'balanced_low_0' or "
@@ -636,7 +635,6 @@ def load_quantized(model_name_or_path: Optional[str],
                                                        device_map=device_map,
                                                        offload_state_dict=True,
                                                        offload_buffers=True)
-    # model = simple_dispatch_model(model, device_map)
 
     # == step4: set seqlen == #
     model_config = model.config.to_dict()
